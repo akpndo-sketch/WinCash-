@@ -1,8 +1,8 @@
 {
   "name": "wincash",
-  "version": "3.0.0",
+  "version": "4.0.0-beta.1",
   "private": true,
-  "description": "WinCash - marketplace with affiliate commissions and cash-on-delivery payments",
+  "description": "WinCash - commerce, affiliation and social communication beta",
   "main": "server.js",
   "scripts": {"start": "node server.js"},
   "engines": {"node": ">=20"},

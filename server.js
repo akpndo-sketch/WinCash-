@@ -17,7 +17,7 @@ const pool = new Pool({
 
 app.set("trust proxy", 1);
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(express.json({ limit: "6mb" }));
+app.use(express.json({ limit: "12mb" }));
 app.use(express.urlencoded({ extended: false }));
 app.use(session({
   store: new PgSession({ pool, tableName: "user_sessions", createTableIfMissing: true }),
@@ -34,7 +34,8 @@ const clean = s => String(s ?? "").trim();
 const email = s => clean(s).toLowerCase();
 const asyncRoute = fn => (req,res,next) => Promise.resolve(fn(req,res,next)).catch(next);
 function requireAuth(req,res,next){ if(!req.session.user) return res.status(401).json({error:"Connectez-vous pour continuer."}); next(); }
-function requireRole(...roles){ return (req,res,next)=>{ if(!req.session.user) return res.status(401).json({error:"Connexion requise."}); if(!(req.session.user.roles||[req.session.user.role]).some(r=>roles.includes(r))) return res.status(403).json({error:"Accès refusé."}); next(); }; }
+function requireRole(...roles){ return (req,res,next)=>{ if(!req.session.user) return res.status(401).json({error:"Connexion requise."}); if(!roles.includes(req.session.user.role)) return res.status(403).json({error:"Accès refusé."}); next(); }; }
+async function notify(userId,kind,title,body="",targetUrl=""){ if(userId) await q("INSERT INTO notifications(user_id,kind,title,body,target_url) VALUES($1,$2,$3,$4,$5)",[userId,kind,title,body,targetUrl]); }
 function validEmail(s){ return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s); }
 
 async function init(){
@@ -42,7 +43,6 @@ async function init(){
     id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
     phone TEXT NOT NULL DEFAULT '', password_hash TEXT NOT NULL,
     role TEXT NOT NULL CHECK(role IN ('customer','seller','affiliate','admin')),
-    roles TEXT[] NOT NULL DEFAULT ARRAY['customer'],
     active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT NOW())`);
   await q(`CREATE TABLE IF NOT EXISTS products(
     id BIGSERIAL PRIMARY KEY, seller_id BIGINT NOT NULL REFERENCES users(id),
@@ -74,20 +74,34 @@ async function init(){
     amount NUMERIC(12,2) NOT NULL CHECK(amount > 0), payout_details TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'requested' CHECK(status IN ('requested','approved','rejected','paid')),
     created_at TIMESTAMPTZ DEFAULT NOW())`);
-  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS roles TEXT[] NOT NULL DEFAULT ARRAY['customer']`);
-  await q(`UPDATE users SET roles=ARRAY[role] WHERE roles IS NULL OR cardinality(roles)=0 OR (roles=ARRAY['customer'] AND role<>'customer')`);
-  await q(`UPDATE products SET active=FALSE WHERE commission<=0`);
-  await q(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS affiliate_name_snapshot TEXT NOT NULL DEFAULT ''`);
-  await q(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS affiliate_phone_snapshot TEXT NOT NULL DEFAULT ''`);
-  await q(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS affiliate_email_snapshot TEXT NOT NULL DEFAULT ''`);
-  await q(`CREATE TABLE IF NOT EXISTS conversations(id BIGSERIAL PRIMARY KEY, user_a BIGINT NOT NULL REFERENCES users(id), user_b BIGINT NOT NULL REFERENCES users(id), created_at TIMESTAMPTZ DEFAULT NOW(), CHECK(user_a < user_b), UNIQUE(user_a,user_b))`);
-  await q(`CREATE TABLE IF NOT EXISTS messages(id BIGSERIAL PRIMARY KEY, conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, sender_id BIGINT NOT NULL REFERENCES users(id), body TEXT NOT NULL, attachment_url TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ DEFAULT NOW())`);
-  await q(`CREATE TABLE IF NOT EXISTS social_groups(id BIGSERIAL PRIMARY KEY, owner_id BIGINT NOT NULL REFERENCES users(id), name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', is_public BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT NOW())`);
-  await q(`CREATE TABLE IF NOT EXISTS group_members(group_id BIGINT NOT NULL REFERENCES social_groups(id) ON DELETE CASCADE, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, joined_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY(group_id,user_id))`);
-  await q(`CREATE TABLE IF NOT EXISTS group_messages(id BIGSERIAL PRIMARY KEY, group_id BIGINT NOT NULL REFERENCES social_groups(id) ON DELETE CASCADE, sender_id BIGINT NOT NULL REFERENCES users(id), body TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW())`);
-  await q(`CREATE TABLE IF NOT EXISTS pages(id BIGSERIAL PRIMARY KEY, owner_id BIGINT NOT NULL REFERENCES users(id), name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ DEFAULT NOW())`);
-  await q(`CREATE TABLE IF NOT EXISTS page_followers(page_id BIGINT NOT NULL REFERENCES pages(id) ON DELETE CASCADE, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, created_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY(page_id,user_id))`);
-  await q(`CREATE TABLE IF NOT EXISTS posts(id BIGSERIAL PRIMARY KEY, author_id BIGINT NOT NULL REFERENCES users(id), page_id BIGINT REFERENCES pages(id) ON DELETE CASCADE, body TEXT NOT NULL DEFAULT '', media_url TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ DEFAULT NOW())`);
+  await q(`CREATE TABLE IF NOT EXISTS messages(
+    id BIGSERIAL PRIMARY KEY, sender_id BIGINT NOT NULL REFERENCES users(id), recipient_id BIGINT NOT NULL REFERENCES users(id),
+    body TEXT NOT NULL DEFAULT '', attachment_name TEXT, attachment_type TEXT, attachment_data TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(), read_at TIMESTAMPTZ,
+    CHECK(sender_id <> recipient_id), CHECK(length(body) <= 5000), CHECK(length(COALESCE(attachment_data,'')) <= 10000000))`);
+  await q(`CREATE TABLE IF NOT EXISTS notifications(
+    id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', target_url TEXT NOT NULL DEFAULT '',
+    read_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT NOW())`);
+  await q(`CREATE TABLE IF NOT EXISTS social_posts(
+    id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id), body TEXT NOT NULL DEFAULT '',
+    media_url TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ DEFAULT NOW(), CHECK(length(body)<=5000))`);
+  await q(`CREATE TABLE IF NOT EXISTS post_comments(
+    id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
+    user_id BIGINT NOT NULL REFERENCES users(id), body TEXT NOT NULL CHECK(length(body)<=2000), created_at TIMESTAMPTZ DEFAULT NOW())`);
+  await q(`CREATE TABLE IF NOT EXISTS post_reactions(
+    post_id BIGINT NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE, user_id BIGINT NOT NULL REFERENCES users(id),
+    reaction TEXT NOT NULL DEFAULT 'like', created_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY(post_id,user_id))`);
+  await q(`CREATE TABLE IF NOT EXISTS social_groups(
+    id BIGSERIAL PRIMARY KEY, owner_id BIGINT NOT NULL REFERENCES users(id), name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '', visibility TEXT NOT NULL DEFAULT 'public' CHECK(visibility IN ('public','private')),
+    created_at TIMESTAMPTZ DEFAULT NOW())`);
+  await q(`CREATE TABLE IF NOT EXISTS group_members(
+    group_id BIGINT NOT NULL REFERENCES social_groups(id) ON DELETE CASCADE, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('owner','member')), joined_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY(group_id,user_id))`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_messages_pair ON messages(sender_id,recipient_id,created_at DESC)`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id,created_at DESC)`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_social_posts_date ON social_posts(created_at DESC)`);
   await q(`CREATE INDEX IF NOT EXISTS idx_products_active ON products(active, created_at DESC)`);
   await q(`CREATE INDEX IF NOT EXISTS idx_orders_seller ON orders(seller_id, created_at DESC)`);
   await q(`CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id, created_at DESC)`);
@@ -95,11 +109,9 @@ async function init(){
   if(process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD){
     const e=email(process.env.ADMIN_EMAIL);
     const found=await q("SELECT id FROM users WHERE email=$1",[e]);
-    const hash=await bcrypt.hash(process.env.ADMIN_PASSWORD,12);
     if(!found.rowCount){
-      await q("INSERT INTO users(name,email,password_hash,role,roles) VALUES($1,$2,$3,'admin',ARRAY['admin'])",["Administrateur",e,hash]);
-    } else {
-      await q("UPDATE users SET password_hash=$2,role='admin',roles=CASE WHEN 'admin'=ANY(roles) THEN roles ELSE array_append(roles,'admin') END,active=TRUE WHERE email=$1",[e,hash]);
+      const hash=await bcrypt.hash(process.env.ADMIN_PASSWORD,12);
+      await q("INSERT INTO users(name,email,password_hash,role) VALUES($1,$2,$3,'admin')",["Administrateur",e,hash]);
     }
   }
 }
@@ -109,21 +121,20 @@ app.get("/health", asyncRoute(async(req,res)=>{await q("SELECT 1");res.json({ok:
 app.post("/api/register", asyncRoute(async(req,res)=>{
   const name=clean(req.body.name), e=email(req.body.email), phone=clean(req.body.phone);
   const password=String(req.body.password||""), role=clean(req.body.role);
-  if(name.length<2 || !validEmail(e) || password.length<8 || !["customer","seller","affiliate"].includes(role)) return res.status(400).json({error:"Vérifiez les champs. Mot de passe : 8 caractères minimum."});
+  if(name.length<2 || !validEmail(e) || password.length<8 || !["customer","seller","affiliate"].includes(role))
+    return res.status(400).json({error:"Vérifiez les champs. Mot de passe : 8 caractères minimum."});
   if(phone.length<5) return res.status(400).json({error:"Ajoutez un numéro de téléphone valide."});
-  const existing=await q("SELECT * FROM users WHERE email=$1",[e]);
-  if(existing.rowCount){
-    if(!(await bcrypt.compare(password,existing.rows[0].password_hash))) return res.status(409).json({error:"Cette adresse existe déjà. Connectez-vous avec son mot de passe pour ajouter un rôle."});
-    const r=await q("UPDATE users SET roles=CASE WHEN $2=ANY(roles) THEN roles ELSE array_append(roles,$2) END, phone=CASE WHEN phone='' THEN $3 ELSE phone END WHERE id=$1 RETURNING id,name,email,phone,role,roles",[existing.rows[0].id,role,phone]);
-    req.session.user=r.rows[0]; return res.status(200).json({user:r.rows[0],message:"Rôle ajouté au compte existant."});
-  }
   const hash=await bcrypt.hash(password,12);
-  const r=await q("INSERT INTO users(name,email,phone,password_hash,role,roles) VALUES($1,$2,$3,$4,$5,ARRAY[$5]) RETURNING id,name,email,phone,role,roles",[name,e,phone,hash,role]);
-  req.session.user=r.rows[0]; res.status(201).json({user:r.rows[0]});
+  try{
+    const r=await q("INSERT INTO users(name,email,phone,password_hash,role) VALUES($1,$2,$3,$4,$5) RETURNING id,name,email,phone,role",
+      [name,e,phone,hash,role]);
+    req.session.user=r.rows[0]; res.status(201).json({user:r.rows[0]});
+  }catch(err){if(err.code==="23505") return res.status(409).json({error:"Cette adresse e-mail est déjà utilisée."}); throw err;}
 }));
+
 app.post("/api/login", asyncRoute(async(req,res)=>{
   const e=email(req.body.email), password=String(req.body.password||"");
-  const r=await q("SELECT id,name,email,phone,role,roles,password_hash,active FROM users WHERE email=$1",[e]);
+  const r=await q("SELECT id,name,email,phone,role,password_hash,active FROM users WHERE email=$1",[e]);
   if(!r.rowCount || !r.rows[0].active || !(await bcrypt.compare(password,r.rows[0].password_hash)))
     return res.status(401).json({error:"E-mail ou mot de passe incorrect."});
   const {password_hash,active,...user}=r.rows[0]; req.session.regenerate(err=>{if(err)return res.status(500).json({error:"Erreur de session."});req.session.user=user;res.json({user});});
@@ -132,15 +143,15 @@ app.post("/api/logout",(req,res)=>req.session.destroy(()=>res.json({ok:true})));
 app.get("/api/me",(req,res)=>res.json({user:req.session.user||null}));
 
 app.get("/api/products", asyncRoute(async(req,res)=>{
-  const r=await q(`SELECT p.id,p.title,p.description,p.category,p.image_url,p.price,p.stock,p.commission,p.delivery_fee,p.created_at,u.name seller_name,u.phone seller_phone,u.email seller_email
+  const r=await q(`SELECT p.id,p.title,p.description,p.category,p.image_url,p.price,p.stock,p.commission,p.delivery_fee,p.created_at,u.name seller_name
     FROM products p JOIN users u ON u.id=p.seller_id WHERE p.active=TRUE AND p.stock>0 ORDER BY p.created_at DESC`);
   res.json({products:r.rows});
 }));
 app.post("/api/products",requireRole("seller"),asyncRoute(async(req,res)=>{
   const b=req.body, title=clean(b.title), description=clean(b.description), category=clean(b.category), image=clean(b.image_url);
   const price=money(b.price), stock=Number(b.stock), commission=money(b.commission||0), fee=money(b.delivery_fee||0);
-  if(title.length<3 || !Number.isFinite(price)||price<=0||!Number.isInteger(stock)||stock<0||commission<=0||fee<0)
-    return res.status(400).json({error:"Vérifiez le nom, le prix, le stock et indiquez une commission affilié supérieure à zéro."});
+  if(title.length<3 || !Number.isFinite(price)||price<=0||!Number.isInteger(stock)||stock<0||commission<0||fee<0)
+    return res.status(400).json({error:"Vérifiez le nom, le prix, le stock et les montants."});
   if(commission>price) return res.status(400).json({error:"La commission ne peut pas dépasser le prix du produit."});
   const r=await q(`INSERT INTO products(seller_id,title,description,category,image_url,price,stock,commission,delivery_fee)
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
@@ -152,7 +163,6 @@ app.get("/api/my/products",requireRole("seller"),asyncRoute(async(req,res)=>{
 }));
 app.patch("/api/products/:id",requireRole("seller"),asyncRoute(async(req,res)=>{
   const b=req.body;
-  if(b.commission!==undefined && (!Number.isFinite(Number(b.commission)) || Number(b.commission)<=0)) return res.status(400).json({error:"Chaque produit doit conserver une commission affilié supérieure à zéro."});
   const r=await q(`UPDATE products SET title=COALESCE($1,title),description=COALESCE($2,description),
     price=COALESCE($3,price),stock=COALESCE($4,stock),commission=COALESCE($5,commission),
     delivery_fee=COALESCE($6,delivery_fee),active=COALESCE($7,active)
@@ -180,8 +190,8 @@ app.post("/api/orders",requireAuth,asyncRoute(async(req,res)=>{
     if(p.stock<qty) throw Object.assign(new Error("Stock insuffisant."),{status:400});
     let aff=null;
     if(affiliateId){
-      const ar=await client.query("SELECT id,role,roles,active FROM users WHERE id=$1",[affiliateId]);
-      if(!ar.rowCount||!(ar.rows[0].roles||[ar.rows[0].role]).includes("affiliate")||!ar.rows[0].active) throw Object.assign(new Error("Lien affilié invalide."),{status:400});
+      const ar=await client.query("SELECT id,role,active FROM users WHERE id=$1",[affiliateId]);
+      if(!ar.rowCount||ar.rows[0].role!=="affiliate"||!ar.rows[0].active) throw Object.assign(new Error("Lien affilié invalide."),{status:400});
       if(Number(affiliateId)===Number(req.session.user.id)) throw Object.assign(new Error("Vous ne pouvez pas être votre propre affilié."),{status:400});
       aff=affiliateId;
     }
@@ -189,9 +199,9 @@ app.post("/api/orders",requireAuth,asyncRoute(async(req,res)=>{
     const deliveryFee=method==="pickup"?0:Number(p.delivery_fee);
     const total=money(Number(p.price)*qty+deliveryFee);
     const code="WC-"+crypto.randomBytes(4).toString("hex").toUpperCase();
-    const ins=await client.query(`INSERT INTO orders(order_code,product_id,seller_id,customer_id,affiliate_id,quantity,unit_price,commission_each,delivery_fee,total,customer_name,customer_phone,delivery_address,delivery_method,affiliate_name_snapshot,affiliate_phone_snapshot,affiliate_email_snapshot)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
-      [code,p.id,p.seller_id,req.session.user.id,aff,qty,p.price,aff?p.commission:0,deliveryFee,total,customerName,customerPhone,address,method,aff?(await client.query("SELECT name FROM users WHERE id=$1",[aff])).rows[0].name:"",aff?(await client.query("SELECT phone FROM users WHERE id=$1",[aff])).rows[0].phone:"",aff?(await client.query("SELECT email FROM users WHERE id=$1",[aff])).rows[0].email:""]);
+    const ins=await client.query(`INSERT INTO orders(order_code,product_id,seller_id,customer_id,affiliate_id,quantity,unit_price,commission_each,delivery_fee,total,customer_name,customer_phone,delivery_address,delivery_method)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+      [code,p.id,p.seller_id,req.session.user.id,aff,qty,p.price,aff?p.commission:0,deliveryFee,total,customerName,customerPhone,address,method]);
     await client.query("UPDATE products SET stock=stock-$1 WHERE id=$2",[qty,p.id]);
     if(aff) await client.query("INSERT INTO commission_ledger(order_id,affiliate_id,amount) VALUES($1,$2,$3)",
       [ins.rows[0].id,aff,money(Number(p.commission)*qty)]);
@@ -282,42 +292,47 @@ app.patch("/api/admin/withdrawals/:id",requireRole("admin"),asyncRoute(async(req
   if(!r.rowCount)return res.status(404).json({error:"Demande introuvable."});
   res.json({withdrawal:r.rows[0]});
 }));
-app.get("/media/:productId",asyncRoute(async(req,res)=>{const r=await q("SELECT image_url FROM products WHERE id=$1",[req.params.productId]);if(!r.rowCount||!r.rows[0].image_url)return res.status(404).end();const value=r.rows[0].image_url;const m=value.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);if(m){res.type(m[1]);return res.send(Buffer.from(m[2],"base64"));}return res.redirect(value);}));
-app.get("/share/:productId",asyncRoute(async(req,res)=>{const r=await q("SELECT p.*,u.name seller_name FROM products p JOIN users u ON u.id=p.seller_id WHERE p.id=$1 AND p.active=TRUE",[req.params.productId]);if(!r.rowCount)return res.status(404).send("Produit introuvable");const p=r.rows[0],ref=Number(req.query.ref)||0;const escHtml=v=>String(v||"").replace(/[&<>\"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'\"':"&quot;","'":"&#39;"}[c]));const url=`${req.protocol}://${req.get("host")}/?product=${p.id}&ref=${ref}&sig=${encodeURIComponent(req.query.sig||"")}`;res.type("html").send(`<!doctype html><html><head><meta charset="utf-8"><meta property="og:type" content="product"><meta property="og:title" content="${escHtml(p.title)}"><meta property="og:description" content="${escHtml(p.description)} — ${p.price} Kz"><meta property="og:image" content="${escHtml(`${req.protocol}://${req.get("host")}/media/${p.id}`)}"><meta property="og:url" content="${url}"><meta name="twitter:card" content="summary_large_image"><meta http-equiv="refresh" content="0;url=${url}"><title>${escHtml(p.title)} — WinCash</title></head><body><a href="${url}">Voir le produit sur WinCash</a></body></html>`);}));
 app.get("/api/affiliate/link/:productId",requireRole("affiliate"),asyncRoute(async(req,res)=>{
   const r=await q("SELECT id FROM products WHERE id=$1 AND active=TRUE",[req.params.productId]);
   if(!r.rowCount)return res.status(404).json({error:"Produit introuvable."});
   const origin=`${req.protocol}://${req.get("host")}`;
-  const sig=crypto.createHmac("sha256",process.env.SESSION_SECRET||"change-this-secret-before-production").update(`${req.params.productId}:${req.session.user.id}`).digest("hex");
-  res.json({link:`${origin}/share/${req.params.productId}?ref=${req.session.user.id}&sig=${sig}`});
+  res.json({link:`${origin}/?product=${req.params.productId}&ref=${req.session.user.id}`});
 }));
 
-// Public member profile and account role management
-app.get("/api/members",requireAuth,asyncRoute(async(req,res)=>{const term=`%${clean(req.query.q)}%`;const r=await q("SELECT id,name,phone,roles FROM users WHERE active=TRUE AND id<>$1 AND (name ILIKE $2 OR email ILIKE $2) ORDER BY name LIMIT 50",[req.session.user.id,term]);res.json({members:r.rows});}));
-app.get("/api/public/members/:id",asyncRoute(async(req,res)=>{const r=await q("SELECT id,name,phone,email,roles FROM users WHERE id=$1 AND active=TRUE",[req.params.id]);if(!r.rowCount)return res.status(404).json({error:"Membre introuvable."});res.json({member:r.rows[0]});}));
-app.post("/api/me/roles",requireAuth,asyncRoute(async(req,res)=>{const role=clean(req.body.role);if(!["customer","seller","affiliate"].includes(role))return res.status(400).json({error:"Rôle invalide."});const r=await q("UPDATE users SET roles=CASE WHEN $2=ANY(roles) THEN roles ELSE array_append(roles,$2) END WHERE id=$1 RETURNING roles",[req.session.user.id,role]);req.session.user.roles=r.rows[0].roles;res.json({roles:r.rows[0].roles});}));
-app.post("/api/me/active-role",requireAuth,asyncRoute(async(req,res)=>{const role=clean(req.body.role);if(!(req.session.user.roles||[]).includes(role))return res.status(403).json({error:"Ce rôle n'est pas activé sur votre compte."});req.session.user.role=role;res.json({role});}));
-app.post("/api/me/delete",requireAuth,asyncRoute(async(req,res)=>{const r=await q("SELECT password_hash FROM users WHERE id=$1",[req.session.user.id]);if(!r.rowCount||!(await bcrypt.compare(String(req.body.password||""),r.rows[0].password_hash)))return res.status(403).json({error:"Mot de passe incorrect."});const marker=`deleted-${req.session.user.id}-${Date.now()}@invalid.local`;await q("UPDATE users SET name='Compte supprimé',email=$2,phone='',password_hash=$3,active=FALSE,roles=ARRAY[]::TEXT[] WHERE id=$1",[req.session.user.id,marker,await bcrypt.hash(crypto.randomBytes(32).toString('hex'),12)]);req.session.destroy(()=>res.json({ok:true,message:"Compte désactivé et données de profil anonymisées. Les traces nécessaires aux commandes et obligations légales sont conservées."}));}));
-// Direct messages: any registered member may start a conversation with another active member.
-app.post("/api/conversations",requireAuth,asyncRoute(async(req,res)=>{const other=Number(req.body.member_id);if(!Number.isInteger(other)||other===Number(req.session.user.id))return res.status(400).json({error:"Destinataire invalide."});const a=Math.min(other,Number(req.session.user.id)),b=Math.max(other,Number(req.session.user.id));const u=await q("SELECT id FROM users WHERE id=$1 AND active=TRUE",[other]);if(!u.rowCount)return res.status(404).json({error:"Membre introuvable."});const r=await q("INSERT INTO conversations(user_a,user_b) VALUES($1,$2) ON CONFLICT(user_a,user_b) DO UPDATE SET user_a=EXCLUDED.user_a RETURNING id",[a,b]);res.json({conversation_id:r.rows[0].id});}));
-app.get("/api/conversations",requireAuth,asyncRoute(async(req,res)=>{const id=req.session.user.id;const r=await q("SELECT c.id,CASE WHEN c.user_a=$1 THEN b.id ELSE a.id END member_id,CASE WHEN c.user_a=$1 THEN b.name ELSE a.name END member_name FROM conversations c JOIN users a ON a.id=c.user_a JOIN users b ON b.id=c.user_b WHERE c.user_a=$1 OR c.user_b=$1 ORDER BY c.created_at DESC",[id]);res.json({conversations:r.rows});}));
-app.get("/api/conversations/:id/messages",requireAuth,asyncRoute(async(req,res)=>{const c=await q("SELECT id FROM conversations WHERE id=$1 AND (user_a=$2 OR user_b=$2)",[req.params.id,req.session.user.id]);if(!c.rowCount)return res.status(403).json({error:"Accès refusé."});const r=await q("SELECT m.*,u.name sender_name FROM messages m JOIN users u ON u.id=m.sender_id WHERE conversation_id=$1 ORDER BY m.created_at LIMIT 200",[req.params.id]);res.json({messages:r.rows});}));
-app.post("/api/conversations/:id/messages",requireAuth,asyncRoute(async(req,res)=>{const body=clean(req.body.body);if(!body||body.length>5000)return res.status(400).json({error:"Message vide ou trop long."});const c=await q("SELECT id FROM conversations WHERE id=$1 AND (user_a=$2 OR user_b=$2)",[req.params.id,req.session.user.id]);if(!c.rowCount)return res.status(403).json({error:"Accès refusé."});const r=await q("INSERT INTO messages(conversation_id,sender_id,body) VALUES($1,$2,$3) RETURNING *",[req.params.id,req.session.user.id,body]);res.status(201).json({message:r.rows[0]});}));
-// Public/private groups
-app.get("/api/groups",requireAuth,asyncRoute(async(req,res)=>{const r=await q("SELECT g.*,u.name owner_name FROM social_groups g JOIN users u ON u.id=g.owner_id WHERE g.is_public=TRUE OR EXISTS(SELECT 1 FROM group_members gm WHERE gm.group_id=g.id AND gm.user_id=$1) ORDER BY g.created_at DESC",[req.session.user.id]);res.json({groups:r.rows});}));
-app.post("/api/groups",requireAuth,asyncRoute(async(req,res)=>{const name=clean(req.body.name);if(name.length<3)return res.status(400).json({error:"Nom de groupe trop court."});const r=await q("INSERT INTO social_groups(owner_id,name,description,is_public) VALUES($1,$2,$3,$4) RETURNING *",[req.session.user.id,name,clean(req.body.description),req.body.is_public!==false]);await q("INSERT INTO group_members(group_id,user_id) VALUES($1,$2)",[r.rows[0].id,req.session.user.id]);res.status(201).json({group:r.rows[0]});}));
-app.post("/api/groups/:id/join",requireAuth,asyncRoute(async(req,res)=>{const g=await q("SELECT id,is_public FROM social_groups WHERE id=$1",[req.params.id]);if(!g.rowCount)return res.status(404).json({error:"Groupe introuvable."});if(!g.rows[0].is_public)return res.status(403).json({error:"Groupe privé."});await q("INSERT INTO group_members(group_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[req.params.id,req.session.user.id]);res.json({ok:true});}));
-app.get("/api/groups/:id/messages",requireAuth,asyncRoute(async(req,res)=>{const m=await q("SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2",[req.params.id,req.session.user.id]);if(!m.rowCount)return res.status(403).json({error:"Rejoignez le groupe pour lire ses messages."});const r=await q("SELECT gm.*,u.name sender_name FROM group_messages gm JOIN users u ON u.id=gm.sender_id WHERE group_id=$1 ORDER BY gm.created_at LIMIT 200",[req.params.id]);res.json({messages:r.rows});}));
-app.post("/api/groups/:id/messages",requireAuth,asyncRoute(async(req,res)=>{const body=clean(req.body.body);const m=await q("SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2",[req.params.id,req.session.user.id]);if(!m.rowCount)return res.status(403).json({error:"Vous ne faites pas partie du groupe."});if(!body||body.length>5000)return res.status(400).json({error:"Message invalide."});const r=await q("INSERT INTO group_messages(group_id,sender_id,body) VALUES($1,$2,$3) RETURNING *",[req.params.id,req.session.user.id,body]);res.status(201).json({message:r.rows[0]});}));
-// Public shop pages and posts
-app.get("/api/pages",asyncRoute(async(req,res)=>{const r=await q("SELECT p.*,u.name owner_name FROM pages p JOIN users u ON u.id=p.owner_id ORDER BY p.created_at DESC");res.json({pages:r.rows});}));
-app.post("/api/pages",requireAuth,asyncRoute(async(req,res)=>{const name=clean(req.body.name);if(name.length<3)return res.status(400).json({error:"Nom de page trop court."});const r=await q("INSERT INTO pages(owner_id,name,description) VALUES($1,$2,$3) RETURNING *",[req.session.user.id,name,clean(req.body.description)]);res.status(201).json({page:r.rows[0]});}));
-app.post("/api/pages/:id/follow",requireAuth,asyncRoute(async(req,res)=>{await q("INSERT INTO page_followers(page_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[req.params.id,req.session.user.id]);res.json({ok:true});}));
-app.get("/api/posts",asyncRoute(async(req,res)=>{const r=await q("SELECT p.*,u.name author_name,pg.name page_name FROM posts p JOIN users u ON u.id=p.author_id LEFT JOIN pages pg ON pg.id=p.page_id ORDER BY p.created_at DESC LIMIT 100");res.json({posts:r.rows});}));
-app.post("/api/posts",requireAuth,asyncRoute(async(req,res)=>{const body=clean(req.body.body),media=clean(req.body.media_url);if(!body&&!media)return res.status(400).json({error:"Ajoutez un texte ou un média."});const pageId=req.body.page_id?Number(req.body.page_id):null;if(pageId){const own=await q("SELECT id FROM pages WHERE id=$1 AND owner_id=$2",[pageId,req.session.user.id]);if(!own.rowCount)return res.status(403).json({error:"Vous ne gérez pas cette page."});}const r=await q("INSERT INTO posts(author_id,page_id,body,media_url) VALUES($1,$2,$3,$4) RETURNING *",[req.session.user.id,pageId,body,media]);res.status(201).json({post:r.rows[0]});}));
+// MESSAGERIE PRIVEE, PIECES JOINTES ET NOTIFICATIONS
+app.get("/api/members",requireAuth,asyncRoute(async(req,res)=>{
+ const term=`%${clean(req.query.q).slice(0,60)}%`;
+ const r=await q("SELECT id,name,role FROM users WHERE active=TRUE AND id<>$1 AND name ILIKE $2 ORDER BY name LIMIT 50",[req.session.user.id,term]); res.json({members:r.rows});
+}));
+app.get("/api/messages/:userId",requireAuth,asyncRoute(async(req,res)=>{
+ const other=Number(req.params.userId); if(!Number.isInteger(other)||other===Number(req.session.user.id))return res.status(400).json({error:"Destinataire invalide."});
+ const r=await q(`SELECT m.id,m.sender_id,m.recipient_id,m.body,m.attachment_name,m.attachment_type,m.attachment_data,m.created_at,m.read_at,u.name sender_name
+ FROM messages m JOIN users u ON u.id=m.sender_id WHERE (m.sender_id=$1 AND m.recipient_id=$2) OR (m.sender_id=$2 AND m.recipient_id=$1) ORDER BY m.created_at ASC LIMIT 200`,[req.session.user.id,other]);
+ await q("UPDATE messages SET read_at=NOW() WHERE sender_id=$1 AND recipient_id=$2 AND read_at IS NULL",[other,req.session.user.id]); res.json({messages:r.rows});
+}));
+app.post("/api/messages",requireAuth,asyncRoute(async(req,res)=>{
+ const to=Number(req.body.recipient_id), body=clean(req.body.body), a=req.body.attachment||null;
+ if(!Number.isInteger(to)||to===Number(req.session.user.id)||body.length>5000||(!body&&!a))return res.status(400).json({error:"Message invalide."});
+ if(a&&(!/^data:(image\/(png|jpeg|gif|webp)|application\/pdf|text\/plain);base64,/.test(a.data||"")||String(a.data).length>10000000||clean(a.name).length>180))return res.status(400).json({error:"Pièce jointe non autorisée (images, PDF ou texte, 7 Mo maximum)."});
+ const u=await q("SELECT id FROM users WHERE id=$1 AND active=TRUE",[to]); if(!u.rowCount)return res.status(404).json({error:"Membre introuvable."});
+ const r=await q(`INSERT INTO messages(sender_id,recipient_id,body,attachment_name,attachment_type,attachment_data) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,created_at`,[req.session.user.id,to,body,a?clean(a.name):null,a?(a.data.split(';')[0].replace('data:','')):null,a?a.data:null]);
+ await notify(to,"message","Nouveau message",body.slice(0,160),"/social.html?chat="+req.session.user.id); res.status(201).json({message:r.rows[0]});
+}));
+app.get("/api/notifications",requireAuth,asyncRoute(async(req,res)=>{const r=await q("SELECT * FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100",[req.session.user.id]);res.json({notifications:r.rows});}));
+app.patch("/api/notifications/:id/read",requireAuth,asyncRoute(async(req,res)=>{const r=await q("UPDATE notifications SET read_at=NOW() WHERE id=$1 AND user_id=$2 RETURNING id",[req.params.id,req.session.user.id]);if(!r.rowCount)return res.status(404).json({error:"Notification introuvable."});res.json({ok:true});}));
+app.post("/api/notifications/read-all",requireAuth,asyncRoute(async(req,res)=>{await q("UPDATE notifications SET read_at=NOW() WHERE user_id=$1 AND read_at IS NULL",[req.session.user.id]);res.json({ok:true});}));
+// FIL SOCIAL : PUBLICATIONS, COMMENTAIRES, REACTIONS
+app.get("/api/social/posts",requireAuth,asyncRoute(async(req,res)=>{const r=await q(`SELECT p.*,u.name author_name,(SELECT COUNT(*)::int FROM post_comments c WHERE c.post_id=p.id) comments_count,(SELECT COUNT(*)::int FROM post_reactions x WHERE x.post_id=p.id) reactions_count,(SELECT reaction FROM post_reactions x WHERE x.post_id=p.id AND x.user_id=$1) my_reaction FROM social_posts p JOIN users u ON u.id=p.user_id ORDER BY p.created_at DESC LIMIT 100`,[req.session.user.id]);res.json({posts:r.rows});}));
+app.post("/api/social/posts",requireAuth,asyncRoute(async(req,res)=>{const body=clean(req.body.body),media=clean(req.body.media_url);if(!body&&!media||body.length>5000||media.length>2000)return res.status(400).json({error:"Publication invalide."});const r=await q("INSERT INTO social_posts(user_id,body,media_url) VALUES($1,$2,$3) RETURNING *",[req.session.user.id,body,media]);res.status(201).json({post:r.rows[0]});}));
+app.post("/api/social/posts/:id/comments",requireAuth,asyncRoute(async(req,res)=>{const body=clean(req.body.body);if(!body||body.length>2000)return res.status(400).json({error:"Commentaire invalide."});const p=await q("SELECT user_id FROM social_posts WHERE id=$1",[req.params.id]);if(!p.rowCount)return res.status(404).json({error:"Publication introuvable."});const r=await q("INSERT INTO post_comments(post_id,user_id,body) VALUES($1,$2,$3) RETURNING *",[req.params.id,req.session.user.id,body]);if(Number(p.rows[0].user_id)!==Number(req.session.user.id))await notify(p.rows[0].user_id,"comment","Nouveau commentaire",body.slice(0,150),"/social.html");res.status(201).json({comment:r.rows[0]});}));
+app.get("/api/social/posts/:id/comments",requireAuth,asyncRoute(async(req,res)=>{const r=await q("SELECT c.*,u.name author_name FROM post_comments c JOIN users u ON u.id=c.user_id WHERE c.post_id=$1 ORDER BY c.created_at ASC",[req.params.id]);res.json({comments:r.rows});}));
+app.post("/api/social/posts/:id/react",requireAuth,asyncRoute(async(req,res)=>{const reaction=clean(req.body.reaction||"like");if(!["like","love","support"].includes(reaction))return res.status(400).json({error:"Réaction invalide."});await q("INSERT INTO post_reactions(post_id,user_id,reaction) VALUES($1,$2,$3) ON CONFLICT(post_id,user_id) DO UPDATE SET reaction=EXCLUDED.reaction",[req.params.id,req.session.user.id,reaction]);res.json({ok:true});}));
+// GROUPES PUBLICS/PRIVES
+app.get("/api/social/groups",requireAuth,asyncRoute(async(req,res)=>{const r=await q(`SELECT g.*,u.name owner_name,(SELECT COUNT(*)::int FROM group_members gm WHERE gm.group_id=g.id) members_count,EXISTS(SELECT 1 FROM group_members gm WHERE gm.group_id=g.id AND gm.user_id=$1) joined FROM social_groups g JOIN users u ON u.id=g.owner_id WHERE g.visibility='public' OR EXISTS(SELECT 1 FROM group_members gm WHERE gm.group_id=g.id AND gm.user_id=$1) ORDER BY g.created_at DESC`,[req.session.user.id]);res.json({groups:r.rows});}));
+app.post("/api/social/groups",requireAuth,asyncRoute(async(req,res)=>{const name=clean(req.body.name),description=clean(req.body.description),visibility=clean(req.body.visibility||"public");if(name.length<3||name.length>100||description.length>1000||!["public","private"].includes(visibility))return res.status(400).json({error:"Informations du groupe invalides."});const r=await q("INSERT INTO social_groups(owner_id,name,description,visibility) VALUES($1,$2,$3,$4) RETURNING *",[req.session.user.id,name,description,visibility]);await q("INSERT INTO group_members(group_id,user_id,role) VALUES($1,$2,'owner')",[r.rows[0].id,req.session.user.id]);res.status(201).json({group:r.rows[0]});}));
+app.post("/api/social/groups/:id/join",requireAuth,asyncRoute(async(req,res)=>{const g=await q("SELECT * FROM social_groups WHERE id=$1",[req.params.id]);if(!g.rowCount)return res.status(404).json({error:"Groupe introuvable."});if(g.rows[0].visibility==="private")return res.status(403).json({error:"Ce groupe est privé : demandez une invitation à son propriétaire."});await q("INSERT INTO group_members(group_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",[req.params.id,req.session.user.id]);res.json({ok:true});}));
 
 app.use((err,req,res,next)=>{console.error(err);res.status(500).json({error:"Erreur interne. Réessayez plus tard."});});
-app.get("/admin",(req,res)=>res.sendFile(require("path").join(__dirname,"public","admin.html")));
 app.get("*",(req,res)=>res.sendFile(require("path").join(__dirname,"public","index.html")));
 
 init().then(()=>app.listen(port,()=>console.log(`WinCash running on ${port}`))).catch(err=>{console.error("Database initialization failed:",err);process.exit(1);});

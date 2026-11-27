@@ -1,11 +1,16 @@
 {
   "name": "wincash",
-  "version": "4.0.0-beta.1",
+  "version": "5.2.0",
   "private": true,
-  "description": "WinCash - commerce, affiliation and social communication beta",
+  "description": "WinCash marketplace, private messaging, attachments, notifications and social community",
   "main": "server.js",
-  "scripts": {"start": "node server.js"},
-  "engines": {"node": ">=20"},
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node scripts/smoke-check.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "bcryptjs": "^2.4.3",
     "connect-pg-simple": "^10.0.0",

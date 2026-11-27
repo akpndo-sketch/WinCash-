@@ -79,6 +79,7 @@ async function init(){
     body TEXT NOT NULL DEFAULT '', attachment_name TEXT, attachment_type TEXT, attachment_data TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(), read_at TIMESTAMPTZ,
     CHECK(sender_id <> recipient_id), CHECK(length(body) <= 5000), CHECK(length(COALESCE(attachment_data,'')) <= 10000000))`);
+  await q(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS recipient_id BIGINT REFERENCES users(id)`);
   await q(`CREATE TABLE IF NOT EXISTS notifications(
     id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', target_url TEXT NOT NULL DEFAULT '',
